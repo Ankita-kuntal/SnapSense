@@ -47,5 +47,26 @@ contextBridge.exposeInMainWorld('snapsense', {
   getApiKeyStatus: () => ipcRenderer.invoke('get-api-key-status'),
   getModelMode: () => ipcRenderer.invoke('get-model-mode'),
   setModelMode: (mode) => ipcRenderer.invoke('set-model-mode', { mode }),
-  closePanel: () => ipcRenderer.send('panel-close')
+  setOpenAiApiKey: (token) => ipcRenderer.invoke('set-openai-api-key', { token }),
+  setOpenAiModel: (model) => ipcRenderer.invoke('set-openai-model', { model }),
+  closePanel: () => ipcRenderer.send('panel-close'),
+
+  requestFollowUpCapture: () => {
+    console.info('[SnapSense preload] request-follow-up-capture → main (send)');
+    ipcRenderer.send('request-follow-up-capture');
+  },
+
+  onFollowUpCapture: (fn) => {
+    const handler = (_, payload) => fn(payload);
+    ipcRenderer.on('follow-up-capture', handler);
+    return () => ipcRenderer.removeListener('follow-up-capture', handler);
+  },
+
+  getStealthMode: () => ipcRenderer.invoke('get-stealth-mode'),
+  setStealthMode: (enabled) => ipcRenderer.invoke('set-stealth-mode', { enabled }),
+  onStealthModeChange: (fn) => {
+    const handler = (_, payload) => fn(payload);
+    ipcRenderer.on('stealth-mode-changed', handler);
+    return () => ipcRenderer.removeListener('stealth-mode-changed', handler);
+  }
 });

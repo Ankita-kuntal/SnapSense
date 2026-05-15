@@ -1,22 +1,35 @@
 {
   "name": "snapsense",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "description": "SnapSense — tray screenshot + AI overlay",
   "author": "SnapSense",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
-    "pack": "node scripts/bake-key-for-dist.js && electron-builder --dir && node scripts/clear-baked-key.js",
-    "dist": "node scripts/bake-key-for-dist.js && electron-builder --win --x64 && node scripts/clear-baked-key.js"
+    "pack": "node scripts/bake-key-for-dist.js && electron-builder --dir",
+    "dist": "node scripts/bake-key-for-dist.js && electron-builder",
+    "dist:win": "node scripts/bake-key-for-dist.js && electron-builder --win nsis --x64",
+    "dist:linux": "node scripts/bake-key-for-dist.js && electron-builder --linux AppImage",
+    "dist:mac": "node scripts/bake-key-for-dist.js && electron-builder --mac dmg",
+    "dist:win:local": "node scripts/bake-key-for-dist.js && electron-builder --win nsis --x64 --publish never",
+    "dist:linux:local": "node scripts/bake-key-for-dist.js && electron-builder --linux AppImage --publish never",
+    "dist:mac:local": "node scripts/bake-key-for-dist.js && electron-builder --mac dmg --publish never"
   },
   "build": {
+    "publish": {
+      "provider": "github",
+      "releaseType": "release",
+      "publishAutoUpdate": false
+    },
+    "afterAllArtifactBuild": "./scripts/prune-release-artifacts.js",
     "appId": "com.snapsense.app",
     "productName": "SnapSense",
     "icon": "assets/icon.png",
     "copyright": "Copyright © SnapSense",
     "directories": {
-      "output": "dist"
+      "output": "dist",
+      "buildResources": "assets"
     },
     "files": [
       "src/**/*",
@@ -24,6 +37,7 @@
       "package.json"
     ],
     "win": {
+      "icon": "assets/icon.png",
       "signAndEditExecutable": false,
       "target": [
         {
@@ -35,7 +49,27 @@
       ],
       "artifactName": "${productName}-Setup-${version}.${ext}"
     },
+    "mac": {
+      "icon": "assets/icon.png",
+      "category": "public.app-category.productivity",
+      "target": ["dmg"],
+      "extendInfo": {
+        "NSScreenCaptureUsageDescription": "SnapSense captures only the screen region you choose after you press the shortcut."
+      }
+    },
+    "dmg": {
+      "writeUpdateInfo": false
+    },
+    "linux": {
+      "icon": "assets/icon.png",
+      "category": "Utility",
+      "target": [
+        "AppImage"
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
     "nsis": {
+      "differentialPackage": false,
       "oneClick": false,
       "perMachine": false,
       "allowElevation": true,

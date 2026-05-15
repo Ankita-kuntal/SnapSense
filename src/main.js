@@ -10,13 +10,26 @@ const {
   desktopCapturer,
   session,
   shell,
-  clipboard
+  clipboard,
+  systemPreferences,
+  dialog
 } = require('electron');
 const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const log = require('./logger');
-const { getAiKeyStatus, getPrompt, requestAi, getModelMode, setModelMode } = require('./aiClient');
+const {
+  getAiKeyStatus,
+  getPrompt,
+  requestAi,
+  getModelMode,
+  setModelMode,
+  getOpenAiModel,
+  setOpenAiModel,
+  getStealthMode,
+  setStealthMode
+} = require('./aiClient');
+const { setOpenAiApiKey } = require('./secureCredentials');
 
 const CAPTURE_PRELOAD = path.join(__dirname, 'preload.js');
 const PANEL_PRELOAD = path.join(__dirname, 'preload.js');
@@ -55,6 +68,10 @@ function loadEnvFile() {
 loadEnvFile();
 
 const ASSETS_ROOT = path.join(__dirname, '..', 'assets');
+
+/** First successful globalShortcut accelerator for region capture (platform-specific). */
+let registeredCaptureAccelerator = null;
+let macScreenRecordingHelpShown = false;
 
 function logMissingUiAssets() {
   const interPath = path.join(ASSETS_ROOT, 'fonts', 'Inter.ttf');
@@ -96,11 +113,15 @@ let tray = null;
 let captureWin = null;
 let modeStripWin = null;
 let panelWin = null;
+/** Whether stealth mode is currently active. */
+let stealthActive = false;
 /** Mode chosen in floating strip during active capture */
 let captureSessionMode = 'ai';
 let captureEscapeShortcutRegistered = false;
 /** Incremented on each capture start so stale async work cannot open duplicate windows */
 let captureFlowGeneration = 0;
+/** True while panel requested a region capture for chat follow-up (panel hidden, not destroyed). */
+let followUpCapturePending = false;
 /** One GET to google.com so CONSENT / cookies exist before Lens POST (Chromium fetch only). */
 let googleLensSessionPrimed = false;
 
@@ -646,21 +667,109 @@ function trayIconPath() {
   return appIconPath();
 }
 
-async function pickScreenSourceId() {
-  const primary = screen.getPrimaryDisplay();
-  const sources = await desktopCapturer.getSources({
-    types: ['screen'],
-    thumbnailSize: { width: 150, height: 150 },
-    fetchWindowIcons: false
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function requestMacAccessibilityTrust() {
+  if (process.platform !== 'darwin') return;
+  try {
+    const trusted = systemPreferences.isTrustedAccessibilityClient(true);
+    log.info('main', 'macOS Accessibility (trusted client)', { trusted });
+  } catch (e) {
+    log.warn('main', 'isTrustedAccessibilityClient', { message: e?.message });
+  }
+}
+
+async function showMacScreenRecordingHelpOnce() {
+  if (macScreenRecordingHelpShown || process.platform !== 'darwin') return;
+  macScreenRecordingHelpShown = true;
+  const { response } = await dialog.showMessageBox({
+    type: 'warning',
+    title: 'Screen Recording required',
+    message: 'SnapSense could not read any displays.',
+    detail:
+      'On macOS, allow Screen Recording for SnapSense:\n\n' +
+      'System Settings → Privacy & Security → Screen Recording → enable SnapSense.\n\n' +
+      'Then quit SnapSense fully (menu bar → Quit) and open it again.',
+    buttons: ['Open Screen Recording settings', 'OK'],
+    defaultId: 0,
+    cancelId: 1
   });
-  if (!sources.length) {
-    log.error('main', 'No desktop capture sources');
+  if (response === 0) {
+    try {
+      await shell.openExternal(
+        'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'
+      );
+    } catch (e) {
+      log.warn('main', 'open Screen Recording prefs', { message: e?.message });
+    }
+  }
+}
+
+async function pickScreenSourceId() {
+  if (process.platform === 'darwin') {
+    try {
+      const screenStatus = systemPreferences.getMediaAccessStatus('screen');
+      log.info('main', 'macOS Screen Recording consent status', { screenStatus });
+    } catch (e) {
+      log.debug('main', 'getMediaAccessStatus(screen)', { message: e?.message });
+    }
+  }
+  try {
+    const primary = screen.getPrimaryDisplay();
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: 150, height: 150 },
+      fetchWindowIcons: false
+    });
+    if (!sources.length) {
+      log.error('main', 'No desktop capture sources');
+      if (process.platform === 'darwin') {
+        await showMacScreenRecordingHelpOnce();
+      }
+      return null;
+    }
+    const match = sources.find((s) => String(s.display_id) === String(primary.id));
+    const picked = match || sources[0];
+    log.info('main', 'Desktop source', { id: picked.id, name: picked.name, display_id: picked.display_id });
+    return picked.id;
+  } catch (e) {
+    log.error('main', 'desktopCapturer.getSources failed', { message: e?.message });
     return null;
   }
-  const match = sources.find((s) => String(s.display_id) === String(primary.id));
-  const picked = match || sources[0];
-  log.info('main', 'Desktop source', { id: picked.id, name: picked.name, display_id: picked.display_id });
-  return picked.id;
+}
+
+async function hideWindowForCapture(win) {
+  if (!win || win.isDestroyed()) {
+    log.warn('main', 'hideWindowForCapture: window missing');
+    return;
+  }
+  log.info('main', 'hideWindowForCapture: starting');
+  await new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    const tid = setTimeout(finish, 140);
+    win.once('hide', () => {
+      clearTimeout(tid);
+      finish();
+    });
+    try {
+      win.hide();
+    } catch (e) {
+      clearTimeout(tid);
+      log.debug('main', 'Follow-up hide panel', { message: e?.message });
+      finish();
+    }
+  });
+  // Give Windows a brief beat to settle z-order/composition before opening
+  // the transparent fullscreen capture overlay.
+  await delay(60);
+  log.info('main', 'hideWindowForCapture: done');
 }
 
 function destroyModeStripWindow() {
@@ -801,6 +910,56 @@ function createCaptureWindow(sourceId) {
   registerCaptureEscapeShortcut();
 }
 
+/**
+ * Enable or disable stealth mode on the panel window.
+ * - setContentProtection(true) → WDA_EXCLUDEFROMCAPTURE on Windows; invisible to Zoom/Meet/Discord/Teams.
+ * - setSkipTaskbar(true)        → removes from Windows taskbar.
+ * - Tray icon destroyed/rebuilt so the app has no visible system presence.
+ * Must be re-applied on every 'focus' event because Electron may reset it after hide/show cycles.
+ */
+function applyStealthMode(enabled) {
+  stealthActive = Boolean(enabled);
+  log.info('main', 'Stealth mode', { enabled: stealthActive });
+
+  // Apply window-level stealth FIRST — this must always run even if persist fails.
+  if (panelWin && !panelWin.isDestroyed()) {
+    try {
+      panelWin.setContentProtection(stealthActive);
+      panelWin.setSkipTaskbar(stealthActive);
+    } catch (e) {
+      log.warn('main', 'applyStealthMode panelWin error', { message: e?.message });
+    }
+  }
+
+  // Persist preference after applying (write failure must not block the above).
+  try {
+    setStealthMode(stealthActive);
+  } catch (e) {
+    log.warn('main', 'applyStealthMode persist error', { message: e?.message });
+  }
+
+  if (stealthActive) {
+    if (tray) {
+      try {
+        tray.destroy();
+      } catch {
+        /* ignore */
+      }
+      tray = null;
+      log.info('main', 'Tray destroyed for stealth mode');
+    }
+  } else {
+    if (!tray) {
+      buildTray();
+      log.info('main', 'Tray rebuilt after stealth mode off');
+    }
+  }
+
+  if (panelWin && !panelWin.isDestroyed()) {
+    panelWin.webContents.send('stealth-mode-changed', { enabled: stealthActive });
+  }
+}
+
 function createPanelWindow(payload) {
   destroyPanelWindow();
   const display = screen.getPrimaryDisplay();
@@ -852,14 +1011,104 @@ function createPanelWindow(payload) {
     panelWin.focus();
   });
 
+  panelWin.on('focus', () => {
+    // Re-apply content protection on every focus gain — Electron resets it after hide/show cycles
+    // (see https://github.com/electron/electron/issues/45844).
+    if (stealthActive && panelWin && !panelWin.isDestroyed()) {
+      try {
+        panelWin.setContentProtection(true);
+      } catch {
+        /* ignore */
+      }
+    }
+  });
+
   panelWin.on('closed', () => {
     panelWin = null;
   });
 
+  // Restore persisted stealth preference on each new panel window.
+  stealthActive = getStealthMode();
+  if (stealthActive) {
+    setImmediate(() => {
+      if (panelWin && !panelWin.isDestroyed()) {
+        try {
+          panelWin.setContentProtection(true);
+          panelWin.setSkipTaskbar(true);
+        } catch {
+          /* ignore */
+        }
+        if (tray) {
+          try { tray.destroy(); } catch { /* ignore */ }
+          tray = null;
+        }
+        panelWin.webContents.send('stealth-mode-changed', { enabled: true });
+      }
+    });
+  }
+
   log.info('main', 'Panel window created');
 }
 
+/**
+ * Same region capture as Win+Alt+S, but keeps the chat panel and returns the image to it (follow-up).
+ */
+async function startFollowUpCaptureFlow() {
+  if (!panelWin || panelWin.isDestroyed()) {
+    log.warn('main', 'Follow-up capture: no panel');
+    return;
+  }
+  if (followUpCapturePending || (captureWin && !captureWin.isDestroyed())) {
+    log.warn('main', 'Follow-up capture skipped: already active', {
+      followUpCapturePending,
+      hasCaptureWin: Boolean(captureWin && !captureWin.isDestroyed())
+    });
+    return;
+  }
+  const gen = ++captureFlowGeneration;
+  log.info('main', 'Follow-up capture flow started', { gen });
+  destroyCaptureWindow();
+  followUpCapturePending = true;
+  captureSessionMode = 'ai';
+  try {
+    // Resolve desktopCapturer while the panel is still visible. On Windows, calling
+    // getSources with no visible BrowserWindow can return no sources or behave oddly.
+    log.info('main', 'Follow-up capture: resolving desktop source', { gen });
+    const sourceId = await pickScreenSourceId();
+    if (gen !== captureFlowGeneration) {
+      log.info('main', 'Follow-up capture superseded (generation mismatch)', { gen, current: captureFlowGeneration });
+      followUpCapturePending = false;
+      if (panelWin && !panelWin.isDestroyed()) {
+        panelWin.show();
+        panelWin.focus();
+      }
+      return;
+    }
+    if (!sourceId) {
+      log.warn('main', 'Follow-up capture: no desktop source');
+      followUpCapturePending = false;
+      if (panelWin && !panelWin.isDestroyed()) {
+        panelWin.show();
+        panelWin.focus();
+      }
+      return;
+    }
+    log.info('main', 'Follow-up capture: hiding panel before overlay', { gen, sourceId });
+    await hideWindowForCapture(panelWin);
+    log.info('main', 'Follow-up capture: creating capture window', { gen });
+    createCaptureWindow(sourceId);
+  } catch (e) {
+    log.error('main', 'Follow-up capture failed', { message: e.message, gen });
+    followUpCapturePending = false;
+    if (panelWin && !panelWin.isDestroyed()) {
+      panelWin.show();
+      panelWin.focus();
+    }
+  }
+}
+
 async function startCaptureFlow() {
+  followUpCapturePending = false;
   const gen = ++captureFlowGeneration;
   log.info('main', 'Capture flow started', { gen });
   destroyPanelWindow();
@@ -884,16 +1133,54 @@ async function startCaptureFlow() {
   }
 }
 
+/**
+ * Global capture hotkey. On Windows/Linux we use Super+Alt+S (Win+Alt+S).
+ * On macOS use Command+Alt+S (⌘⌥S) explicitly — `Super+Alt+S` is unreliable in some Electron builds.
+ */
+function getCaptureAcceleratorCandidates() {
+  if (process.platform === 'darwin') {
+    return ['Command+Alt+S', 'Control+Alt+S', 'Super+Alt+S'];
+  }
+  return ['Super+Alt+S'];
+}
+
+function captureShortcutHint() {
+  if (process.platform === 'darwin') return '⌘⌥S';
+  if (process.platform === 'win32') return 'Win+Alt+S';
+  return 'Super+Alt+S';
+}
+
 function registerShortcut() {
-  const accel = 'Super+Alt+S';
-  const ok = globalShortcut.register(accel, () => {
-    log.info('main', 'Global shortcut', accel);
-    startCaptureFlow();
-  });
-  if (!ok) {
-    log.error('main', 'Failed to register shortcut', { accel });
-  } else {
-    log.info('main', 'Shortcut registered', { accel });
+  registeredCaptureAccelerator = null;
+  const candidates = getCaptureAcceleratorCandidates();
+  for (const accel of candidates) {
+    const ok = globalShortcut.register(accel, () => {
+      log.info('main', 'Global shortcut', { accel });
+      startCaptureFlow();
+    });
+    if (ok) {
+      registeredCaptureAccelerator = accel;
+      log.info('main', 'Shortcut registered', { accel });
+      if (tray && !tray.isDestroyed()) {
+        tray.setToolTip(`SnapSense — ${captureShortcutHint()} to capture`);
+      }
+      return;
+    }
+    log.warn('main', 'Shortcut registration failed, trying next', { accel });
+  }
+  log.error('main', 'All capture shortcut candidates failed', { candidates });
+  if (process.platform === 'darwin') {
+    dialog
+      .showMessageBox({
+        type: 'warning',
+        title: 'SnapSense',
+        message: 'Could not register the global capture shortcut.',
+        detail:
+          'Try: System Settings → Privacy & Security → Accessibility → enable SnapSense, then restart the app.\n\n' +
+          'You can still use the menu bar icon → Capture region.',
+        buttons: ['OK']
+      })
+      .catch(() => {});
   }
 }
 
@@ -904,7 +1191,51 @@ function buildTray() {
     icon = nativeImage.createEmpty();
   }
   tray = new Tray(icon);
-  tray.setToolTip('SnapSense — Win+Alt+S to capture');
+  tray.setToolTip(`SnapSense — ${captureShortcutHint()} to capture`);
+
+  const installationSubmenu = [];
+  if (process.platform === 'darwin') {
+    installationSubmenu.push({
+      label: 'Show app in Finder',
+      click: () => {
+        try {
+          shell.showItemInFolder(app.getPath('exe'));
+        } catch (e) {
+          log.warn('main', 'showItemInFolder', { message: e?.message });
+        }
+      }
+    });
+  } else {
+    installationSubmenu.push({
+      label: 'Open install folder',
+      click: () => {
+        const dir = path.dirname(app.getPath('exe'));
+        shell.openPath(dir).then((errMsg) => {
+          if (errMsg) log.warn('main', 'openPath install folder', { err: errMsg });
+        });
+      }
+    });
+    if (process.platform === 'win32') {
+      installationSubmenu.push({
+        label: 'Open Start Menu (SnapSense)',
+        click: () => {
+          const programs = path.join(
+            process.env.APPDATA || '',
+            'Microsoft',
+            'Windows',
+            'Start Menu',
+            'Programs'
+          );
+          const category = path.join(programs, 'SnapSense');
+          const target = fs.existsSync(category) ? category : programs;
+          shell.openPath(target).then((errMsg) => {
+            if (errMsg) log.warn('main', 'openPath Start Menu', { err: errMsg });
+          });
+        }
+      });
+    }
+  }
+
   const menu = Menu.buildFromTemplate([
     {
       label: 'Capture region',
@@ -912,34 +1243,7 @@ function buildTray() {
     },
     {
       label: 'Installation',
-      submenu: [
-        {
-          label: 'Open install folder',
-          click: () => {
-            const dir = path.dirname(app.getPath('exe'));
-            shell.openPath(dir).then((errMsg) => {
-              if (errMsg) log.warn('main', 'openPath install folder', { err: errMsg });
-            });
-          }
-        },
-        {
-          label: 'Open Start Menu (SnapSense)',
-          click: () => {
-            const programs = path.join(
-              process.env.APPDATA || '',
-              'Microsoft',
-              'Windows',
-              'Start Menu',
-              'Programs'
-            );
-            const category = path.join(programs, 'SnapSense');
-            const target = fs.existsSync(category) ? category : programs;
-            shell.openPath(target).then((errMsg) => {
-              if (errMsg) log.warn('main', 'openPath Start Menu', { err: errMsg });
-            });
-          }
-        }
-      ]
+      submenu: installationSubmenu
     },
     { type: 'separator' },
     {
@@ -965,9 +1269,16 @@ function setupIpc() {
     return getAiKeyStatus();
   });
 
-  ipcMain.handle('get-model-mode', () => ({ mode: getModelMode() }));
+  ipcMain.handle('get-model-mode', () => ({
+    mode: getModelMode(),
+    openaiModel: getOpenAiModel()
+  }));
 
   ipcMain.handle('set-model-mode', (_evt, { mode }) => ({ mode: setModelMode(mode) }));
+
+  ipcMain.handle('set-openai-api-key', (_evt, { token }) => setOpenAiApiKey(token));
+
+  ipcMain.handle('set-openai-model', (_evt, { model }) => ({ model: setOpenAiModel(model) }));
 
   async function handleExtractText(imageDataUrl) {
     if (!imageDataUrl) {
@@ -986,7 +1297,7 @@ function setupIpc() {
         ]
       }
     ];
-    const out = await requestAi(messages, 2200, log, 'text');
+    const out = await requestAi(messages, 2200, log);
     if (out.error) {
       log.error('main', 'Text extraction via AI failed', { message: out.error });
       return { error: out.error };
@@ -1078,17 +1389,60 @@ function setupIpc() {
     const prompt = getPrompt('chat');
     const normalized = Array.isArray(messages) ? messages : [];
     const merged = prompt ? [{ role: 'system', content: prompt }, ...normalized] : normalized;
-    return requestAi(merged, 4096, log, 'chat');
+    return requestAi(merged, 4096, log);
   });
+
+  const requestFollowUpCapture = async (via) => {
+    log.info('main', 'IPC request-follow-up-capture', { via });
+    await startFollowUpCaptureFlow();
+    return { ok: true };
+  };
+
+  ipcMain.on('request-follow-up-capture', (_evt) => {
+    log.info('main', 'IPC request-follow-up-capture received (on/send)', {
+      senderId: _evt?.sender?.id
+    });
+    requestFollowUpCapture('send').catch((e) => {
+      log.error('main', 'request-follow-up-capture (send) failed', { message: e?.message });
+    });
+  });
+
+  ipcMain.handle('request-follow-up-capture', () => requestFollowUpCapture('invoke'));
 
   ipcMain.on('capture-result', (_evt, payload) => {
     log.info('main', 'Capture result', {
       hasImage: Boolean(payload?.imageDataUrl),
-      mime: payload?.mime
+      mime: payload?.mime,
+      followUp: followUpCapturePending
     });
     destroyCaptureWindow();
     if (!payload?.imageDataUrl) {
       log.warn('main', 'Empty capture result');
+      if (followUpCapturePending) {
+        followUpCapturePending = false;
+        if (panelWin && !panelWin.isDestroyed()) {
+          panelWin.show();
+          panelWin.focus();
+        }
+      }
+      return;
+    }
+    if (followUpCapturePending && panelWin && !panelWin.isDestroyed()) {
+      followUpCapturePending = false;
+      panelWin.show();
+      panelWin.focus();
+      setImmediate(() => {
+        if (!panelWin.isDestroyed()) {
+          const len = typeof payload.imageDataUrl === 'string' ? payload.imageDataUrl.length : 0;
+          log.info('main', 'Sending follow-up-capture to panel', { mime: payload.mime || 'image/png', dataUrlChars: len });
+          panelWin.webContents.send('follow-up-capture', {
+            imageDataUrl: payload.imageDataUrl,
+            mime: payload.mime || 'image/png'
+          });
+        } else {
+          log.warn('main', 'follow-up-capture: panel destroyed before send');
+        }
+      });
       return;
     }
     createPanelWindow({
@@ -1099,13 +1453,27 @@ function setupIpc() {
   });
 
   ipcMain.on('capture-cancel', () => {
-    log.info('main', 'Capture cancelled');
+    log.info('main', 'Capture cancelled', { followUpPending: followUpCapturePending });
     destroyCaptureWindow();
+    if (followUpCapturePending) {
+      followUpCapturePending = false;
+      if (panelWin && !panelWin.isDestroyed()) {
+        panelWin.show();
+        panelWin.focus();
+      }
+    }
   });
 
   ipcMain.on('panel-close', () => {
     log.info('main', 'Panel close requested');
     destroyPanelWindow();
+  });
+
+  ipcMain.handle('get-stealth-mode', () => ({ enabled: getStealthMode() }));
+
+  ipcMain.handle('set-stealth-mode', (_evt, { enabled }) => {
+    applyStealthMode(Boolean(enabled));
+    return { enabled: stealthActive };
   });
 }
 
@@ -1119,6 +1487,7 @@ app.whenReady().then(() => {
   });
   log.info('main', 'App ready', { version: app.getVersion() });
   logMissingUiAssets();
+  requestMacAccessibilityTrust();
   setupIpc();
   buildTray();
   registerShortcut();
